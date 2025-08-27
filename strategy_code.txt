@@ -1,0 +1,367 @@
+//@version=5
+strategy("Multi-Session Daily Breakout Strategy v2", overlay=true, initial_capital=100000, 
+         default_qty_type=strategy.cash, default_qty_value=200, 
+         process_orders_on_close=false, calc_on_every_tick=true)
+
+// Risk type selection
+risk_type = input.string("Fixed USD", "Risk Type", options=["Percentage", "Fixed USD", "Fixed Contracts"])
+risk_value = switch risk_type
+    "Fixed USD" => input.float(200.0, "Risk Amount in USD", minval=1.0, step=1.0)
+    "Fixed Contracts" => input.float(1.0, "Number of Contracts", minval=0.1, step=0.1)
+    "Percentage" => input.float(1.0, "Risk Percentage", minval=0.1, maxval=100.0, step=0.1)
+
+// Input parameters
+sl_buffer_pips = input.float(0.2, "Stop Loss Buffer (in pips)", minval=0.0, step=0.1)
+tp_multiplier = input.float(3.0, "Take Profit Multiplier", minval=0.1, step=0.1)
+
+// Take Profit execution settings
+tp_execution = input.string("Aggressive", "TP Execution Mode", 
+    options=["Standard", "Aggressive", "Immediate"], 
+    tooltip="Standard: Uses limit orders\nAggressive: Checks TP on every tick\nImmediate: Market exit when TP reached",
+    group="Exit Settings")
+tp_reduction_percent = input.float(0, "Reduce TP by % for faster fills", minval=0, maxval=10, step=0.1, 
+    tooltip="Reduces TP target by this percentage for faster execution", group="Exit Settings")
+
+// New trailing stop loss inputs
+activate_trail_points = input.int(20, "Activate Trailing SL after points in profit", minval=1)
+trail_buffer_points = input.int(5, "Trailing Buffer in points", minval=1)
+
+// Session selection inputs
+trade_asia = input.bool(true, "Trade Asia Session", group="Session Settings")
+trade_london = input.bool(true, "Trade London Session", group="Session Settings")
+trade_ny = input.bool(true, "Trade New York Session", group="Session Settings")
+
+// Auto-close at entry input
+auto_close_at_entry = input.bool(true, "Auto Close at Entry Price", group="Exit Settings")
+entry_buffer_pips = input.float(0.1, "Entry Close Buffer (in pips)", minval=0.0, step=0.1, group="Exit Settings")
+
+// Partial take profit
+use_partial_tp = input.bool(true, "Use Partial Take Profit", group="Exit Settings")
+partial_tp_percent = input.float(50, "Partial TP %", minval=10, maxval=90, step=10, group="Exit Settings")
+partial_tp_multiplier = input.float(1.5, "Partial TP Multiplier", minval=0.5, maxval=5, step=0.1, group="Exit Settings")
+
+// Backtester Inputs
+showTable = input.bool(true, title="Show Statistics Table", group="Performance Table", tooltip="If enabled it will display the performance stats on the chart")
+startingBalance = input.float(defval=100000, title="Starting Balance", minval=0, group="Performance Table", tooltip="Starting balance for built in backtester")
+
+// Session times (in exchange timezone)
+// Asia Session (Tokyo: 00:00 - 09:00 UTC)
+asia_start_hour = 0
+asia_start_minute = 0
+asia_end_hour = 9
+asia_end_minute = 0
+
+// London Session (08:00 - 17:00 UTC)
+london_start_hour = 8
+london_start_minute = 0
+london_end_hour = 17
+london_end_minute = 0
+
+// New York Session (13:00 - 22:00 UTC)
+ny_start_hour = 13
+ny_start_minute = 0
+ny_end_hour = 22
+ny_end_minute = 0
+
+// NYSE specific open time
+nyse_open_hour = 9
+nyse_open_minute = 30
+candle_minutes = 15
+
+// Variables to store session candle data
+var float asia_first_candle_high = na
+var float asia_first_candle_low = na
+var float london_first_candle_high = na
+var float london_first_candle_low = na
+var float ny_first_candle_high = na
+var float ny_first_candle_low = na
+
+// Track current session
+var string current_session = "none"
+var float session_first_candle_high = na
+var float session_first_candle_low = na
+var bool session_candle_captured = false
+
+// Trade management variables
+var int trades_today = 0
+var int candle_counter = 0
+var float entry_price = na
+var bool in_trade = false
+var float target_tp = na
+var float target_sl = na
+var bool partial_taken = false
+
+// Function to check if current time is within a session
+is_in_session(start_h, start_m, end_h, end_m) =>
+    current_time = hour * 60 + minute
+    start_time = start_h * 60 + start_m
+    end_time = end_h * 60 + end_m
+    
+    if start_time <= end_time
+        current_time >= start_time and current_time < end_time
+    else
+        current_time >= start_time or current_time < end_time
+
+// Check which session we're in
+in_asia = trade_asia and is_in_session(asia_start_hour, asia_start_minute, asia_end_hour, asia_end_minute)
+in_london = trade_london and is_in_session(london_start_hour, london_start_minute, london_end_hour, london_end_minute)
+in_ny = trade_ny and is_in_session(ny_start_hour, ny_start_minute, ny_end_hour, ny_end_minute)
+
+// Determine current session and capture first candle
+new_session = in_asia ? "asia" : in_london ? "london" : in_ny ? "ny" : "none"
+
+// Detect session change
+if new_session != current_session
+    current_session := new_session
+    session_candle_captured := false
+    candle_counter := 0
+    
+// Capture first candle of each session
+if not session_candle_captured and current_session != "none"
+    session_first_candle_high := high
+    session_first_candle_low := low
+    session_candle_captured := true
+    
+    // Store session-specific values
+    if current_session == "asia"
+        asia_first_candle_high := high
+        asia_first_candle_low := low
+    else if current_session == "london"
+        london_first_candle_high := high
+        london_first_candle_low := low
+    else if current_session == "ny"
+        ny_first_candle_high := high
+        ny_first_candle_low := low
+
+// Reset daily counter at midnight
+if hour == 0 and minute == 0
+    trades_today := 0
+
+// Increment candle counter
+if current_session != "none"
+    candle_counter := candle_counter + 1
+
+// Function to calculate position size based on risk
+calculate_position_size(stop_loss_price) =>
+    stop_loss_distance = math.abs(close - stop_loss_price)
+    position_size = switch risk_type
+        "Percentage" => (strategy.equity * (risk_value / 100)) / stop_loss_distance
+        "Fixed USD" => risk_value / stop_loss_distance
+        "Fixed Contracts" => risk_value
+    position_size
+
+// Aggressive TP checking for long positions
+if tp_execution != "Standard" and strategy.position_size > 0 and not na(target_tp)
+    adjusted_tp = target_tp * (1 - tp_reduction_percent / 100)
+    
+    // Check for partial TP
+    if use_partial_tp and not partial_taken
+        partial_tp_level = entry_price + (target_tp - entry_price) * partial_tp_multiplier / tp_multiplier
+        if high >= partial_tp_level
+            strategy.close("Long", qty_percent=partial_tp_percent, comment="Partial TP")
+            partial_taken := true
+    
+    // Check for full TP
+    if high >= adjusted_tp
+        if tp_execution == "Immediate"
+            strategy.close("Long", comment="TP Hit (Market)")
+            in_trade := false
+            entry_price := na
+            target_tp := na
+            target_sl := na
+            partial_taken := false
+
+// Aggressive TP checking for short positions
+if tp_execution != "Standard" and strategy.position_size < 0 and not na(target_tp)
+    adjusted_tp = target_tp * (1 + tp_reduction_percent / 100)
+    
+    // Check for partial TP
+    if use_partial_tp and not partial_taken
+        partial_tp_level = entry_price - (entry_price - target_tp) * partial_tp_multiplier / tp_multiplier
+        if low <= partial_tp_level
+            strategy.close("Short", qty_percent=partial_tp_percent, comment="Partial TP")
+            partial_taken := true
+    
+    // Check for full TP
+    if low <= adjusted_tp
+        if tp_execution == "Immediate"
+            strategy.close("Short", comment="TP Hit (Market)")
+            in_trade := false
+            entry_price := na
+            target_tp := na
+            target_sl := na
+            partial_taken := false
+
+// Auto-close at entry logic
+if auto_close_at_entry and strategy.position_size != 0 and not na(entry_price)
+    entry_buffer = entry_buffer_pips * syminfo.mintick * 10
+    
+    // For long positions
+    if strategy.position_size > 0
+        if low <= entry_price + entry_buffer
+            strategy.close("Long", comment="Closed at Entry")
+            in_trade := false
+            entry_price := na
+            target_tp := na
+            target_sl := na
+            partial_taken := false
+    
+    // For short positions
+    if strategy.position_size < 0
+        if high >= entry_price - entry_buffer
+            strategy.close("Short", comment="Closed at Entry")
+            in_trade := false
+            entry_price := na
+            target_tp := na
+            target_sl := na
+            partial_taken := false
+
+// Trading logic - Allow up to 6 trades per day
+is_trading_time = current_session != "none"
+if is_trading_time and strategy.position_size == 0 and trades_today < 6 and session_candle_captured
+    sl_buffer = sl_buffer_pips * syminfo.mintick * 10  // Convert pips to price
+
+    // Long entry
+    if close > session_first_candle_high
+        stop_loss = session_first_candle_low - sl_buffer
+        take_profit = session_first_candle_high + (session_first_candle_high - session_first_candle_low) * tp_multiplier
+        
+        // Adjust TP for execution mode
+        if tp_execution == "Standard"
+            take_profit := take_profit * (1 - tp_reduction_percent / 100)
+        
+        position_size = calculate_position_size(stop_loss)
+        
+        strategy.entry("Long", strategy.long, qty=position_size)
+        entry_price := close
+        in_trade := true
+        target_tp := take_profit
+        target_sl := stop_loss
+        partial_taken := false
+        
+        // Only use strategy.exit for standard mode or for stop loss
+        if tp_execution == "Standard"
+            strategy.exit("Long Exit", "Long", 
+                          stop=stop_loss, 
+                          limit=take_profit, 
+                          trail_points=math.round((session_first_candle_high - stop_loss) / syminfo.mintick), 
+                          trail_offset=trail_buffer_points, 
+                          trail_price=high - (activate_trail_points * syminfo.mintick))
+        else
+            // For aggressive modes, only set stop loss via strategy.exit
+            strategy.exit("Long SL", "Long", 
+                          stop=stop_loss,
+                          trail_points=math.round((session_first_candle_high - stop_loss) / syminfo.mintick), 
+                          trail_offset=trail_buffer_points, 
+                          trail_price=high - (activate_trail_points * syminfo.mintick))
+        
+        trades_today := trades_today + 1
+    
+    // Short entry
+    if close < session_first_candle_low
+        stop_loss = session_first_candle_high + sl_buffer
+        take_profit = session_first_candle_low - (session_first_candle_high - session_first_candle_low) * tp_multiplier
+        
+        // Adjust TP for execution mode
+        if tp_execution == "Standard"
+            take_profit := take_profit * (1 + tp_reduction_percent / 100)
+        
+        position_size = calculate_position_size(stop_loss)
+        
+        strategy.entry("Short", strategy.short, qty=position_size)
+        entry_price := close
+        in_trade := true
+        target_tp := take_profit
+        target_sl := stop_loss
+        partial_taken := false
+        
+        // Only use strategy.exit for standard mode or for stop loss
+        if tp_execution == "Standard"
+            strategy.exit("Short Exit", "Short", 
+                          stop=stop_loss, 
+                          limit=take_profit, 
+                          trail_points=math.round((stop_loss - session_first_candle_low) / syminfo.mintick), 
+                          trail_offset=trail_buffer_points, 
+                          trail_price=low + (activate_trail_points * syminfo.mintick))
+        else
+            // For aggressive modes, only set stop loss via strategy.exit
+            strategy.exit("Short SL", "Short", 
+                          stop=stop_loss,
+                          trail_points=math.round((stop_loss - session_first_candle_low) / syminfo.mintick), 
+                          trail_offset=trail_buffer_points, 
+                          trail_price=low + (activate_trail_points * syminfo.mintick))
+        
+        trades_today := trades_today + 1
+
+// Reset trade variables when position closes
+if strategy.position_size == 0 and in_trade
+    in_trade := false
+    entry_price := na
+    target_tp := na
+    target_sl := na
+    partial_taken := false
+
+// Plotting - show levels for current session
+plot_condition = candle_counter <= 8 and current_session != "none"
+plot(plot_condition ? session_first_candle_high : na, color=color.green, linewidth=2, style=plot.style_linebr, title="Session High")
+plot(plot_condition ? session_first_candle_low : na, color=color.red, linewidth=2, style=plot.style_linebr, title="Session Low")
+
+// Plot entry price and targets when in trade
+plot(in_trade ? entry_price : na, color=color.blue, linewidth=1, style=plot.style_cross, title="Entry Price")
+plot(in_trade ? target_tp : na, color=color.lime, linewidth=1, style=plot.style_circles, title="Take Profit")
+plot(in_trade ? target_sl : na, color=color.red, linewidth=1, style=plot.style_circles, title="Stop Loss")
+
+// Session background colors
+bgcolor(in_asia ? color.new(color.yellow, 90) : na, title="Asia Session")
+bgcolor(in_london ? color.new(color.blue, 90) : na, title="London Session")
+bgcolor(in_ny ? color.new(color.green, 90) : na, title="NY Session")
+
+// Calculate statistics
+var int totalTrades = 0
+var float returnDollars = 0.0
+var float returnPercent = 0.0
+var float winRate = 0.0
+var float endingBalance = 0.0
+var float maxDrawdown = 0.0
+var float maxDrawdownPercent = 0.0
+
+//Table Calculations
+if (barstate.islastconfirmedhistory)
+    totalTrades := strategy.closedtrades
+    returnDollars := strategy.netprofit
+    returnPercent := (strategy.netprofit / startingBalance) * 100
+    winRate := strategy.closedtrades > 0 ? (strategy.wintrades / strategy.closedtrades) * 100 : 0
+    endingBalance := strategy.equity
+    maxDrawdown := strategy.max_drawdown
+    maxDrawdownPercent := (maxDrawdown / startingBalance) * 100
+
+// Create and populate the table
+var table stats = table.new(position.top_right, columns=2, rows=8, border_width=1, border_color = color.black, frame_width = 1, frame_color = color.black)
+
+if showTable
+    if na(stats)
+        stats := table.new(position.top_right, columns=2, rows=8, border_width=1, border_color = color.black, frame_width = 1, frame_color = color.black)
+    if (barstate.islastconfirmedhistory)
+        table.cell(stats, 0, 0, "Total Trades", bgcolor=color.new(color.black, 40), text_color=color.white)
+        table.cell(stats, 1, 0, str.tostring(totalTrades), bgcolor = color.new(color.black, 40), text_color=color.white)
+    
+        table.cell(stats, 0, 1, "Starting $", bgcolor=color.new(color.black, 40), text_color=color.white)
+        table.cell(stats, 1, 1, "$" + str.tostring(startingBalance, "#.##"), bgcolor = color.new(color.black, 40), text_color=color.white)
+    
+        table.cell(stats, 0, 2, "Return $", bgcolor=color.new(color.green, 40), bgcolor = color.new(color.green, 40), text_color=color.white)
+        table.cell(stats, 1, 2, "$" + str.tostring(returnDollars, "#.##"), bgcolor = color.new(color.green, 40), text_color=color.white)
+    
+        table.cell(stats, 0, 3, "Return %", bgcolor=color.new(color.green, 40), bgcolor = color.new(color.green, 40), text_color=color.white)
+        table.cell(stats, 1, 3, str.tostring(returnPercent, "#.##") + "%", bgcolor = color.new(color.green, 50), text_color=color.white)
+    
+        table.cell(stats, 0, 4, "Win Rate", bgcolor=color.new(color.black, 40), text_color=color.white)
+        table.cell(stats, 1, 4, str.tostring(winRate, "#.##") + "%", bgcolor = color.new(color.black, 40), text_color=color.white)
+    
+        table.cell(stats, 0, 5, "Ending $", bgcolor=color.new(color.black, 40), text_color=color.white)
+        table.cell(stats, 1, 5, "$" + str.tostring(endingBalance, "#.##"), bgcolor = color.new(color.black, 40), text_color=color.white)
+    
+        table.cell(stats, 0, 6, "Max DD", bgcolor=color.new(color.red, 40), text_color=color.white)
+        table.cell(stats, 1, 6, "$" + str.tostring(maxDrawdown, "#.##"), bgcolor = color.new(color.red, 40), text_color=color.white)
+
+        table.cell(stats, 0, 7, "Max DD %", bgcolor=color.new(color.red, 40), text_color=color.white)
+        table.cell(stats, 1, 7, str.tostring(maxDrawdownPercent, "#.##") + "%", bgcolor = color.new(color.red, 40), text_color=color.white)
